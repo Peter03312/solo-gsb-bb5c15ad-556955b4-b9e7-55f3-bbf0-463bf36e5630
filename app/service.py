@@ -72,6 +72,35 @@ def _fingerprint(obj: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _legacy_seal_intact_omitted(
+    canonical: dict[str, Any], seal_intact_omitted: bool
+) -> dict[str, Any] | None:
+    """修复前指纹的兼容视图：仅对“省略 seal_intact 的封签检查”返回按旧默认值
+    （省略被错误落为 false）计算的规范字典；其余请求返回 None。
+
+    历史上 ``_event_canonical`` 以 ``bool(None)=False`` 落库，故修复前省略该字段
+    （或显式传 null，旧行为同为 false）的同号重试，其既有行 content_hash 与新默认值
+    （true）不一致。幂等/冲突判定时用本视图补算旧哈希：命中既有行仍按同请求幂等返回
+    原结果（原行不改写、不重算指纹），未命中则照常按异内容 409——不得因新默认值
+    重算任何历史指纹。显式提交 true/false 的请求新旧行为一致，不走兼容视图。
+    """
+    if not seal_intact_omitted or canonical.get("event_type") != "seal_check":
+        return None
+    legacy = dict(canonical)
+    legacy["seal_intact"] = False
+    return legacy
+
+
+def _hashes_match_history(
+    existing_hash: str, canonical: dict[str, Any], seal_intact_omitted: bool = False
+) -> bool:
+    """既有内容指纹与本次提交是否一致（含省略 seal_intact 的旧哈希兼容）。"""
+    if existing_hash == _fingerprint(canonical):
+        return True
+    legacy = _legacy_seal_intact_omitted(canonical, seal_intact_omitted)
+    return legacy is not None and existing_hash == _fingerprint(legacy)
+
+
 def get_sample_or_404(conn: sqlite3.Connection, sample_code: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM sample WHERE sample_code = ?", (sample_code,)).fetchone()
     if row is None:
@@ -144,6 +173,15 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
 
 # --------------------------------------------------------------------------- 事件写入
 
+def _seal_intact_omitted(data: EventIn | NewEventIn) -> bool:
+    """封签检查请求是否省略 seal_intact（键缺省或显式 null）。
+
+    修复前这两种形态都被 ``bool(None)`` 落为 false；只有它们需要按旧哈希兼容
+    历史幂等。显式 true/false 的新旧语义一致。
+    """
+    return data.event_type == "seal_check" and data.seal_intact is None
+
+
 def _event_canonical(data: EventIn | NewEventIn, sample_code: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """构造参与指纹的规范字典与落库 payload（字段集随事件类型固定）。
 
@@ -162,7 +200,11 @@ def _event_canonical(data: EventIn | NewEventIn, sample_code: str | None = None)
     elif data.event_type == "receive":
         payload = {"transfer_no": data.transfer_no, "receiver": data.receiver, "seal_no": data.seal_no}
     elif data.event_type == "seal_check":
-        payload = {"checked_seal_no": data.checked_seal_no, "seal_intact": bool(data.seal_intact)}
+        # 省略 seal_intact（或显式 null）按封签完好（true）处理；
+        # 仅明确提交 false 才表示封签破损（见 evaluate 核验规则）。
+        # 注意：修复前曾以 bool(None)=False 落库，历史行的幂等兼容见
+        # _legacy_seal_intact_omitted / _hashes_match_history，旧行不重算、不改写。
+        payload = {"checked_seal_no": data.checked_seal_no, "seal_intact": data.seal_intact is not False}
     else:  # storage
         payload = {"custodian": data.custodian or LAB_CUSTODIAN}
         if data.storage_location is not None:
@@ -190,13 +232,14 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
 
     canonical, payload = _event_canonical(data)
     h = _fingerprint(canonical)
+    omitted = _seal_intact_omitted(data)
     payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     # 幂等查重优先于冻结检查：既有规则（同 event_id 同内容 200 / 异内容 409）
     # 在核定入库后也保持兼容；新增事件才受历史冻结限制。
     existing = conn.execute("SELECT * FROM custody_event WHERE event_id = ?", (data.event_id,)).fetchone()
     if existing is not None:
-        if existing["content_hash"] != h:
+        if not _hashes_match_history(existing["content_hash"], canonical, omitted):
             raise DomainError(
                 409,
                 "event_conflict",
@@ -226,7 +269,7 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
     except sqlite3.IntegrityError:
         # 并发下唯一键竞争：重新读取后按幂等/冲突处理
         existing = conn.execute("SELECT * FROM custody_event WHERE event_id = ?", (data.event_id,)).fetchone()
-        if existing is not None and existing["content_hash"] == h:
+        if existing is not None and _hashes_match_history(existing["content_hash"], canonical, omitted):
             return existing, True
         raise DomainError(409, "event_conflict", f"事件号 {data.event_id} 并发写入且内容冲突")
 
@@ -496,17 +539,28 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     new_canonical: dict[str, Any] | None = None
     new_payload_json: str | None = None
     new_hash: str | None = None
+    # 替换纠错中的新事件若省略 seal_intact，记录该形态以便按旧哈希兼容历史幂等
+    # （与单事件上报同一套 _event_canonical 归一与历史指纹规则）。
+    new_seal_intact_omitted = False
     if data.new_event is not None:
         new_canonical, new_payload = _event_canonical(data.new_event, sample_code=data.sample_code)
         new_payload_json = json.dumps(new_payload, ensure_ascii=False, separators=(",", ":"))
         new_hash = _fingerprint(new_canonical)
+        new_seal_intact_omitted = _seal_intact_omitted(data.new_event)
 
     request_hash = _correction_fingerprint(data, new_canonical)
+    legacy_request_hash: str | None = None
+    if new_canonical is not None:
+        legacy_new_canonical = _legacy_seal_intact_omitted(new_canonical, new_seal_intact_omitted)
+        if legacy_new_canonical is not None:
+            legacy_request_hash = _correction_fingerprint(data, legacy_new_canonical)
 
-    # 1) 同纠错号：同内容幂等 / 异内容冲突（与既有事件上报语义一致）
+    # 1) 同纠错号：同内容幂等 / 异内容冲突（与既有事件上报语义一致）。
+    #    省略 seal_intact 的替换新事件另按修复前旧指纹补算：修复前已落库的同号
+    #    纠错重试仍幂等返回原结果；历史 request_hash 不重算、不改写。
     existing = _get_correction(conn, data.correction_id)
     if existing is not None:
-        if existing["request_hash"] != request_hash:
+        if existing["request_hash"] != request_hash and existing["request_hash"] != legacy_request_hash:
             raise DomainError(
                 409,
                 "correction_conflict",

@@ -14,7 +14,7 @@
 | 移交（transfer） | 必须由**当前保管人**发起；**移交至签收期间不得再次移交**，否则无效 |
 | 签收（receive） | 必须同时满足：匹配在途**移交单号**、**接收人**与移交单一致、**封签号**与登记一致、签收时间**晚于**移交时间 |
 | 重复签收 | 同一移交单被签收两次 → 无效（无效事件不可被后续补录抵消） |
-| 封签检查（seal_check） | 检查封签号与登记不符，或封签破损（`seal_intact=false`）→ 无效 |
+| 封签检查（seal_check） | 检查封签号与登记不符，或封签破损（明确提交 `seal_intact=false`）→ 无效；**省略 `seal_intact`（或缺省字段、传 `null`）按完好（`true`）处理**（历史上省略曾被误记为 `false`，见 5.15 用法变动） |
 | 缺签收 | 移交后没有合格签收 → **待补证** |
 | 缺入库 | 没有实验室入库记录，或入库缺失前序移交-签收链 → **待补证** |
 | 保管人断链 | 移交人不是当前保管人 / 签收无对应在途移交 → **无效** |
@@ -196,7 +196,7 @@ curl http://localhost:8080/api/v1/samples        # 查看 3 条演示样本的�
 |---|---|---|
 | `transfer` | `transfer_no`、`from_custodian`、`to_custodian` | 移交单号、交出方（须当前保管人）、接收方 |
 | `receive` | `transfer_no`、`receiver`、`seal_no` | 匹配单号、签收人（须等于接收方）、签收封签号 |
-| `seal_check` | `checked_seal_no`（`seal_intact` 默认 true） | 检查读取的封签号、是否完好 |
+| `seal_check` | `checked_seal_no`（`seal_intact` 可省略，省略按 `true`） | 检查读取的封签号、是否完好（仅明确 `false` 判破损） |
 | `storage` | 无（建议 `custodian`、`storage_location`） | 实验室入库，`custodian` 默认“实验室” |
 
 公共字段：`event_id`（全局唯一）、`sample_code`、`occurred_at`、可选 `note`（备注参与幂等指纹）。
@@ -214,9 +214,15 @@ curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/j
   "occurred_at":"2026-09-30T04:00:00Z",
   "transfer_no":"TR-1","receiver":"李运输","seal_no":"SEAL-001"}'
 
-# 封签检查
+# 封签检查（省略 seal_intact：按封签完好处理，等同 true）
 curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
   "event_id":"EVT-C1","event_type":"seal_check","sample_code":"S-001",
+  "occurred_at":"2026-09-30T04:30:00Z",
+  "checked_seal_no":"SEAL-001"}'
+
+# 封签检查（明确封签完好，可显式写 true；明确 false 才表示封签破损）
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"EVT-C1B","event_type":"seal_check","sample_code":"S-001",
   "occurred_at":"2026-09-30T04:30:00Z",
   "checked_seal_no":"SEAL-001","seal_intact":true}'
 
@@ -229,6 +235,7 @@ curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/j
 
 - 新事件 `201`；同 `event_id` 同内容重试 `200`（`idempotent: true`）；异内容 `409 event_conflict`。
 - 响应中 `evaluation.status` / `reasons` / `current_custodian` 为写入后重算结果。
+- **封签检查的 `seal_intact`**：字段可省略（或缺省、传 `null`），一律按封签完好（`true`）落库并参与核验；只有**明确提交 `false`** 才表示封签破损并判无效。单事件上报与纠错替换（`new_event`）语义一致。该字段参与幂等指纹：省略与显式 `true` 归一为同一指纹；修复前省略被误落为 `false` 的既有事件保持原样，其同请求（省略）重试仍幂等返回原结果，显式 `true`/异内容仍报冲突（详见 5.15）。
 
 ### 5.3 查询
 
@@ -1429,6 +1436,56 @@ curl -X POST http://localhost:8080/api/v1/temperature-calibrations -H 'Content-T
   "issued_by":"计量员"}'
 ```
 
+### 5.15 封签检查省略 `seal_intact` 的默认值（用法变动）
+
+**变动内容**：封签检查（`seal_check`）只填写 `checked_seal_no`、**省略 `seal_intact`（或字段缺省、显式传 `null`）时，现按封签完好（`true`）处理**；只有**明确提交 `"seal_intact": false`** 才表示封签破损、判链无效。单事件上报与纠错替换（`POST /corrections` 的 `new_event`）语义一致。
+
+此前实现把省略值以 `bool(None)` 落为 `false`：只填封签号且封签号相符的检查会被误记为“封签破损”，即使封签号与登记一致，完整保管链也会被判 `invalid`，入库核定被拒（`422 approval_rejected`）；纠错替换中的同类封签检查同样受影响。
+
+**对新提交的影响（本轮起生效）**：
+
+| 提交形态 | 落库 / 核验 | 同号幂等指纹 |
+|---|---|---|
+| 省略 `seal_intact` / 传 `null` | `seal_intact=true`，封签号相符不产生无效原因 | 与显式 `true` 同一指纹 |
+| `"seal_intact": true` | `true`（完好） | 与省略同一指纹 |
+| `"seal_intact": false` | `false`（破损）→ 无效、核定拒绝 | 独立指纹；省略/`true` 对其同号提交仍报 `409 event_conflict` |
+
+- 新提交的封签检查省略字段时，事件内容（`payload.seal_intact=true`）、核验结论与该次提交形成的**新版本快照**完全一致；失败提交（如冲突、冻结）不留下新事件、纠错记录或版本。
+- 替换纠错同理：新事件省略字段按完好参与仅有效版本重算，纠错响应、链查询与新版本快照中的 `payload` 一致。
+
+**历史数据与幂等（不迁移、不重算）**：
+
+- **已落库事件、纠错记录、历史版本快照与封存案卷保持原样**：修复前省略字段被落为 `false` 的旧事件仍为 `false`，其旧结论（可能是 `invalid`）、旧版本与旧案卷不被重算或改写；这些旧样本的核定仍按旧结论判定。
+- 修复前已存在的编号，用**同请求（省略字段）重试仍幂等返回原结果**（200，响应为原行内容 `false`，不产生新版本）；改为显式 `true` 或任何异内容仍报 `409`——服务端在幂等判定时对“省略封签完好字段”的提交补算修复前旧指纹做兼容，**绝不重算或改写历史指纹本身**。纠错单（含 `new_event` 省略字段）适用同样规则：同纠错号同请求 200、显式 `true`/异内容 `409 correction_conflict`。
+- 启动升级不涉及数据迁移：既有库重启直接沿用，`init_db` 幂等，全部 HTTP API 与启动行为不变。
+
+本轮调用示例：
+
+```bash
+# 1) 只填封签号（省略 seal_intact）→ 按完好；完整链可核定入库
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"EVT-C-OK","event_type":"seal_check","sample_code":"S-001",
+  "occurred_at":"2026-09-30T04:30:00Z","checked_seal_no":"SEAL-001"}'
+# 响应 payload: {"checked_seal_no":"SEAL-001","seal_intact":true}
+
+# 2) 明确破损仍判无效
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"EVT-C-BAD","event_type":"seal_check","sample_code":"S-001",
+  "occurred_at":"2026-09-30T04:30:00Z","checked_seal_no":"SEAL-001","seal_intact":false}'
+
+# 3) 同事件号省略重试（含对修复前旧行）→ 200 幂等返回原结果
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"EVT-C-OK","event_type":"seal_check","sample_code":"S-001",
+  "occurred_at":"2026-09-30T04:30:00Z","checked_seal_no":"SEAL-001"}'
+
+# 4) 替换纠错：新事件省略 seal_intact → 按完好，链按仅有效版本重算为有效
+curl -X POST http://localhost:8080/api/v1/corrections -H 'Content-Type: application/json' -d '{
+  "correction_id":"FIX-C-1","sample_code":"S-001","target_event_id":"EVT-C-WRONG",
+  "action":"replace","operator":"质控员","reason":"扫码识别错误，整体替换",
+  "new_event":{"event_id":"EVT-C-NEW","event_type":"seal_check",
+    "occurred_at":"2026-09-30T04:30:00Z","checked_seal_no":"SEAL-001"}}'
+```
+
 ### 错误响应统一格式
 
 ```json
@@ -1493,7 +1550,7 @@ curl -X POST http://localhost:8080/api/v1/temperature-calibrations -H 'Content-T
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **整批对账签收（收妥+异常混合提交、收妥项落为既有 receive 并升版本、同单号幂等/异内容冲突/批次一次性、缺项整单拒绝、对账查询）** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）** → **案卷封存（指定/缺省版本封存、案卷查询、摘要核验、同号幂等重试、异内容冲突、整卷失败）** → **案卷双人独立复核（摘要核对、两份完整清单、重复复核人拒绝、分歧形成、第三人资格与清单校验、裁决终局、案卷不通过、同号幂等/异内容冲突、越阶段拒绝、复核查询）** → **人员标识与复核回避（登记人员与初始别名、携带修订号增补别名、过期修订号拒绝、别名归属冲突、复核人别名命中采集/移交人整单拒绝、未登记核定人按原字符串命中、回避失败不占复核单号、意见身份归属查询）** → **运输测温证据（一次性设定配置、同内容幂等/异内容冲突、乱序读数记录、同号幂等返回原记录、重复发生时刻/采集前拒绝、超温点与缺测区间复核查询、跨移交签收拆分与逐段归属、签收作废纠错后归属重算）** → **设备校准证明与可信复核（证明补录/作废、逐条缺证原因、仅有证读数评估）** → **可信测温异常处置（查询异常、认可/排除、同摘要仅一次、单号幂等/冲突、过期摘要拒绝、台账）** → **失效追踪（两次查询间补录移交→作废使摘要往返，旧意见永久失效不复活、当前异常未处置、恢复原摘要后以新单号重新处置）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → **封签检查省略 `seal_intact` 按完好（同号幂等、完整链核定 200）、明确 `false` 破损核定 422 与同号 true 冲突、替换纠错新事件省略字段按完好** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **整批对账签收（收妥+异常混合提交、收妥项落为既有 receive 并升版本、同单号幂等/异内容冲突/批次一次性、缺项整单拒绝、对账查询）** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）** → **案卷封存（指定/缺省版本封存、案卷查询、摘要核验、同号幂等重试、异内容冲突、整卷失败）** → **案卷双人独立复核（摘要核对、两份完整清单、重复复核人拒绝、分歧形成、第三人资格与清单校验、裁决终局、案卷不通过、同号幂等/异内容冲突、越阶段拒绝、复核查询）** → **人员标识与复核回避（登记人员与初始别名、携带修订号增补别名、过期修订号拒绝、别名归属冲突、复核人别名命中采集/移交人整单拒绝、未登记核定人按原字符串命中、回避失败不占复核单号、意见身份归属查询）** → **运输测温证据（一次性设定配置、同内容幂等/异内容冲突、乱序读数记录、同号幂等返回原记录、重复发生时刻/采集前拒绝、超温点与缺测区间复核查询、跨移交签收拆分与逐段归属、签收作废纠错后归属重算）** → **设备校准证明与可信复核（证明补录/作废、逐条缺证原因、仅有证读数评估）** → **可信测温异常处置（查询异常、认可/排除、同摘要仅一次、单号幂等/冲突、过期摘要拒绝、台账）** → **失效追踪（两次查询间补录移交→作废使摘要往返，旧意见永久失效不复活、当前异常未处置、恢复原摘要后以新单号重新处置）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
 
 版本复核也可用 curl 直接体验（完整脚本见下）：
 
@@ -1620,6 +1677,7 @@ curl "http://localhost:8080/api/v1/samples/S-001/temperature/anomalies/dispositi
 
 ```bash
 python -m tests.test_chain          # 既有规则：42 项断言
+python -m tests.test_seal_default   # 封签检查省略 seal_intact 默认值修复：61 项断言（含历史幂等兼容）
 python -m tests.test_corrections    # 纠错：65 项断言（含并发）
 python -m tests.test_batches        # 批量移交：83 项断言（含并发）
 python -m tests.test_reconciliations # 整批对账签收：93 项断言（含并发）
@@ -1634,6 +1692,7 @@ python -m tests.test_upgrade        # 启动升级：55 项断言（原子回滚
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
+- `test_seal_default` 覆盖：封签检查省略 `seal_intact`（字段缺省/显式 null）按完好落库且完整链可核定、显式 false 仍判破损并拒绝核定、省略与显式 true 同指纹幂等而 true/false 互判 409、单事件上报与替换纠错的核验结论/事件 payload/新版本快照一致、冲突失败不留事件版本纠错、以修复前归一化模拟的旧库行（事件与替换纠错）保持原 false/原结论/原版本不重算、旧编号同请求省略重试 200 返回原结果而显式 true/异内容 409、启动幂等与 HTTP 可调用。
 - `test_corrections` 覆盖：作废后仅有效版本重算（结论/原因/保管人）、替换生效与多跳替换、原事件与纠错关系留痕及链追溯、审计查询、同纠错号幂等/异内容冲突、跨样本拒绝、非有效版本拒绝、新事件号占用、replace/void 载荷校验、核定后拒绝纠错、同事件号 200/409 兼容、同有效版本并发仅一次成功、纠错与核定并发两种合法结局（可重复运行）。
 - `test_batches` 覆盖：整批提交各份成为既有 transfer（逐份 pending/invalid 与在途信息、时间线批次归属）、整批失败四类原因（批内样本/事件号重复、样本不存在、已核定、事件号占用）且不留批次/事件/明细、冲突聚合与 409/422 优先、同批次号幂等（items 换序、时区归一、核定后仍 200）与异内容 409、批次查询随作废/替换更新（`event_effective`/`current_event_id`）与原始归属留痕、单事件接口对批量事件号 200/409、同批并发一建一幂等、异批事件号交叠一胜整批回滚、批次与核定并发按已提交顺序判定两种结局、载荷校验与失败批次号复用。
 - `test_reconciliations` 覆盖：收妥+异常混合整批提交（收妥落为既有 receive 事件并升版本、异常仅留记录不升版本不关闭在途、统一签收时间/人、按原批次顺序呈现）、整单拒绝十类原因（批次不存在、缺项、批内重复、外来项、收妥事件号批内重复/已占用、移交已作废 `transfer_not_effective`、在途已被单签关闭、移交替换后接收人/单号按当前有效版本判定、签收人/封签/时间四类不合格、样本已核定 409）且不留对账/receive/版本、载荷形态校验（异常带事件字段、收妥缺字段、空原因、空清单）、同单号同内容幂等（换序/时区归一/核定后仍 200）与异内容（改人/时间/封签/收妥↔异常）及跨批次复用 409、批次一次性（新单号 409、失败单号修正后可复用）、**已核定份按收妥或异常任一形态提交均整单 409 `sample_approved`**（混合清单不为其他样本落签收事件/版本、不占签收单号；未核定批次混合清单仍 201；成功对账后样本再核定，同号同内容重试仍 200、异内容/新单号仍按冲突规则）、纠错后查询原对账不改写而 `event_effective`/`current_event_id` 反映作废与替换、对账 receive 走单事件接口 200/409 与核定冻结、并发两场景（同单号一建一幂等、异单号一胜一 `batch_already_reconciled` 落败回滚）、全收妥补齐可核定/全异常不关闭在途可补单签、数据库层终态一致性。
@@ -1669,6 +1728,7 @@ python -m tests.test_upgrade        # 启动升级：55 项断言（原子回滚
 │   └── config.py     # 环境变量配置
 ├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、整批对账签收、版本复核、案卷封存与双人复核、人员标识与复核回避、运输测温证据、校准证明与可信复核、可信测温异常处置与失效追踪全流程）
 ├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
+├── tests/test_seal_default.py # 封签检查省略 seal_intact 默认值修复自测（61 项断言：新默认值/显式 false/单事件与替换纠错核验·内容·快照一致/失败不留痕/历史行原样与旧指纹幂等兼容/启动可用）
 ├── tests/test_corrections.py  # 纠错端到端自测（65 项断言，含并发）
 ├── tests/test_batches.py  # 批量移交端到端自测（83 项断言，含并发）
 ├── tests/test_reconciliations.py # 整批对账签收端到端自测（93 项断言，含并发）

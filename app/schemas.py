@@ -44,7 +44,10 @@ class EventIn(BaseModel):
 
     # seal_check（封签检查）
     checked_seal_no: str | None = Field(None, description="检查时读取的封签号（seal_check 必填）")
-    seal_intact: bool | None = Field(None, description="封签是否完好，默认 true；false 判无效")
+    seal_intact: bool | None = Field(
+        None,
+        description="封签是否完好：省略或传 null 按完好（true）处理；仅明确提交 false 表示封签破损并判无效",
+    )
 
     # storage（实验室入库）
     storage_location: str | None = Field(None, description="入库库位（storage 建议填写）")
@@ -83,7 +86,10 @@ class NewEventIn(BaseModel):
 
     # seal_check（封签检查）
     checked_seal_no: str | None = Field(None, description="检查时读取的封签号（seal_check 必填）")
-    seal_intact: bool | None = Field(None, description="封签是否完好，默认 true；false 判无效")
+    seal_intact: bool | None = Field(
+        None,
+        description="封签是否完好：省略或传 null 按完好（true）处理；仅明确提交 false 表示封签破损并判无效",
+    )
 
     # storage（实验室入库）
     storage_location: str | None = Field(None, description="入库库位（storage 建议填写）")

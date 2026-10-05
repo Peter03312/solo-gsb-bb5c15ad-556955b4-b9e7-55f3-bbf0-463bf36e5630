@@ -206,6 +206,129 @@ def main() -> None:
     s, r = call("GET", f"/samples/{code2}/corrections")
     show("纠错审计查询", s, r)
 
+    # 11.1) 封签检查省略 seal_intact：按完好（true）处理（修复后行为）
+    run_s = uuid.uuid4().hex[:8]
+    sc = f"API-SEAL-{run_s}"
+    s_seal = f"SEAL-SEAL-{run_s}"
+    call("POST", "/samples", {
+        "sample_code": sc,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector,
+        "seal_no": s_seal,
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-S-T1-{run_s}", "event_type": "transfer", "sample_code": sc,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-SEAL-{run_s}", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-S-R1-{run_s}", "event_type": "receive", "sample_code": sc,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": f"TR-SEAL-{run_s}", "receiver": "李运输", "seal_no": s_seal,
+    })
+    # 只填封签号、不写 seal_intact → 落库 seal_intact=true，不再误判破损
+    s, r = call("POST", "/events", {
+        "event_id": f"API-EVT-S-C1-{run_s}", "event_type": "seal_check", "sample_code": sc,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": s_seal,  # 故意省略 seal_intact
+    })
+    show("封签检查省略 seal_intact（按完好落库）", s, r, "event", "payload")
+    # 同事件号同样省略重试 → 200 幂等返回原结果
+    s, r = call("POST", "/events", {
+        "event_id": f"API-EVT-S-C1-{run_s}", "event_type": "seal_check", "sample_code": sc,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": s_seal,
+    })
+    show("省略字段同号重试（200 幂等）", s, r, "idempotent")
+    call("POST", "/events", {
+        "event_id": f"API-EVT-S-S1-{run_s}", "event_type": "storage", "sample_code": sc,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室",
+    })
+    s, r = call("POST", f"/samples/{sc}/approve", {"approver": "质量主管", "note": "省略字段按完好，准予入库"})
+    show("完整链核定入库（200）", s, r, "approval")
+
+    # 11.2) 明确 seal_intact=false 仍判封签破损 → invalid，核定拒绝
+    sc2 = f"API-SEAL-BAD-{run_s}"
+    call("POST", "/samples", {
+        "sample_code": sc2,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector,
+        "seal_no": s_seal,
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SB-T1-{run_s}", "event_type": "transfer", "sample_code": sc2,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-SEALB-{run_s}", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SB-R1-{run_s}", "event_type": "receive", "sample_code": sc2,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": f"TR-SEALB-{run_s}", "receiver": "李运输", "seal_no": s_seal,
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SB-C1-{run_s}", "event_type": "seal_check", "sample_code": sc2,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": s_seal, "seal_intact": False,  # 明确破损
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SB-S1-{run_s}", "event_type": "storage", "sample_code": sc2,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室",
+    })
+    s, r = call("POST", f"/samples/{sc2}/approve", {"approver": "质量主管"})
+    show("明确 seal_intact=false 核定被拒（422）", s, r)
+    # 同号显式 true 与已落库 false 内容不一致 → 409 event_conflict
+    s, r = call("POST", "/events", {
+        "event_id": f"API-EVT-SB-C1-{run_s}", "event_type": "seal_check", "sample_code": sc2,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": s_seal, "seal_intact": True,
+    })
+    show("显式 true 对破损行同号重试（409 event_conflict）", s, r)
+
+    # 11.3) 替换纠错：new_event 省略 seal_intact 同样按完好，链按有效版本重算
+    sc3 = f"API-SEAL-FIX-{run_s}"
+    call("POST", "/samples", {
+        "sample_code": sc3,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector,
+        "seal_no": s_seal,
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SF-T1-{run_s}", "event_type": "transfer", "sample_code": sc3,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-SEALF-{run_s}", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SF-R1-{run_s}", "event_type": "receive", "sample_code": sc3,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": f"TR-SEALF-{run_s}", "receiver": "李运输", "seal_no": s_seal,
+    })
+    # 原检查读错封签号 → invalid
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SF-C1-{run_s}", "event_type": "seal_check", "sample_code": sc3,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": "SEAL-WRONG", "seal_intact": True,
+    })
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-SF-{run_s}",
+        "sample_code": sc3,
+        "target_event_id": f"API-EVT-SF-C1-{run_s}",
+        "action": "replace",
+        "operator": "质控员",
+        "reason": "扫码识别错误，整体替换（新事件省略 seal_intact 按完好）",
+        "new_event": {
+            "event_id": f"API-EVT-SF-C2-{run_s}", "event_type": "seal_check",
+            "occurred_at": "2026-09-30T03:30:00Z",
+            "checked_seal_no": s_seal,  # 省略 seal_intact → true
+        },
+    })
+    show("替换纠错省略 seal_intact（新事件按完好）", s, r, "evaluation", "status")
+    call("POST", "/events", {
+        "event_id": f"API-EVT-SF-S1-{run_s}", "event_type": "storage", "sample_code": sc3,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室",
+    })
+    s, r = call("POST", f"/samples/{sc3}/approve", {"approver": "质量主管"})
+    show("纠错替换后核定入库（200）", s, r, "approval")
+
     # 12) 批量移交：同一交接车次多份样本一次提交
     run_b = uuid.uuid4().hex[:8]
     b_codes = [f"API-BATCH-{run_b}-{i}" for i in (1, 2, 3)]
