@@ -69,13 +69,20 @@ def main() -> None:
     })
     show("签收", s, r, "evaluation")
 
-    # 4) 封签检查
+    # 4) 封签检查：省略 seal_intact 即按完好（true）落库与核验（也可显式传 true）
+    s, r = call("POST", "/events", {
+        "event_id": f"API-EVT-C1-{run_id}", "event_type": "seal_check", "sample_code": code,
+        "occurred_at": "2026-09-30T04:30:00Z",
+        "checked_seal_no": "SEAL-DEMO-1",
+    })
+    show("封签检查（省略 seal_intact=按完好）", s, r, "event", "payload")
+    # 同事件号同内容重试（这次显式传 true，与省略等价）→ 200 幂等
     s, r = call("POST", "/events", {
         "event_id": f"API-EVT-C1-{run_id}", "event_type": "seal_check", "sample_code": code,
         "occurred_at": "2026-09-30T04:30:00Z",
         "checked_seal_no": "SEAL-DEMO-1", "seal_intact": True,
     })
-    show("封签检查", s, r, "evaluation")
+    show("封签检查同号重试（显式 true=同内容）", s, r, "idempotent")
 
     # 5) 实验室入库（缺此节点结论为待补证）
     s, r = call("POST", "/events", {
@@ -108,7 +115,8 @@ def main() -> None:
     for e in r["timeline"]:
         print(" ", e["occurred_at"], e["event_type"], e["event_id"])
 
-    # 8.1) 纠错（替换）：用新事件号替换封签检查，结论按仅有效版本重算
+    # 8.1) 纠错（替换）：用新事件号替换封签检查，结论按仅有效版本重算。
+    #      new_event 同样省略 seal_intact —— 替换新事件按完好落库（与单事件上报同一规则）
     s, r = call("POST", "/corrections", {
         "correction_id": f"API-FIX-C-{run_id}",
         "sample_code": code,
@@ -121,14 +129,13 @@ def main() -> None:
             "event_type": "seal_check",
             "occurred_at": "2026-09-30T04:30:00Z",
             "checked_seal_no": "SEAL-DEMO-1",
-            "seal_intact": True,
             "note": "纠错替换：复核无误",
         },
     })
-    show("纠错-替换（同纠错号同内容重试幂等）", s, r, "correction")
+    show("纠错-替换（new_event 省略 seal_intact=按完好）", s, r, "correction")
     print("  替换后结论:", r["evaluation"]["status"], "| 保管人:", r["evaluation"]["current_custodian"])
 
-    # 8.2) 同纠错号同内容重试 → 200 幂等；异内容 → 409（此处仅演示幂等）
+    # 8.2) 同纠错号同内容重试 → 200 幂等；异内容（如把 seal_intact 改成 false）→ 409
     s, r = call("POST", "/corrections", {
         "correction_id": f"API-FIX-C-{run_id}",
         "sample_code": code,
@@ -141,11 +148,11 @@ def main() -> None:
             "event_type": "seal_check",
             "occurred_at": "2026-09-30T04:30:00Z",
             "checked_seal_no": "SEAL-DEMO-1",
-            "seal_intact": True,
+            "seal_intact": True,  # 显式 true 与省略等价：同内容重试 200；改成 false 则 409
             "note": "纠错替换：复核无误",
         },
     })
-    show("同纠错号同内容重试", s, r, "correction")
+    show("同纠错号同内容重试（显式 true=同内容）", s, r, "correction")
 
     # 8.3) 链查询可追溯被替换记录与纠错关系
     s, r = call("GET", f"/samples/{code}/chain")
@@ -1037,6 +1044,61 @@ def main() -> None:
         "transfer_no": f"TR-FRAC-{run_p}", "receiver": "李运输", "seal_no": f"SEAL-FRAC-{run_p}",
     })
     print("同号改到另一瞬间（异内容冲突）:", s, r.get("error", {}).get("code"))
+
+    # ----------------------------------------------------------------------------
+    # 15) seal_intact 默认规则（本轮用法变动）：
+    #     * 省略 seal_intact 或显式 true 都表示“完好”，二者同内容、互相幂等；
+    #     * 只有明确 false 才表示“封签破损”（封签号相符也判 invalid，核定入库被拒）；
+    #     * 同事件号“省略体 vs 显式 false”属异内容 → 409。
+    #     旧版本曾把省略误落为 false：那些历史记录保持原样，同请求重试仍返回原结果。
+    # ----------------------------------------------------------------------------
+    run_s = uuid.uuid4().hex[:8]
+    scode = f"API-SEAL-{run_s}"
+    call("POST", "/samples", {
+        "sample_code": scode,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector,
+        "seal_no": f"SEAL-SEAL-{run_s}",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-SEAL-T-{run_s}", "event_type": "transfer", "sample_code": scode,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-SEAL-{run_s}", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-SEAL-R-{run_s}", "event_type": "receive", "sample_code": scode,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": f"TR-SEAL-{run_s}", "receiver": "李运输", "seal_no": f"SEAL-SEAL-{run_s}",
+    })
+    # 15.1) 省略 seal_intact → 落库 true（注意返回 payload）
+    s, r = call("POST", "/events", {
+        "event_id": f"API-SEAL-C-{run_s}", "event_type": "seal_check", "sample_code": scode,
+        "occurred_at": "2026-09-30T03:30:00Z", "checked_seal_no": f"SEAL-SEAL-{run_s}",
+    })
+    show("封签检查省略 seal_intact（落库 true）", s, r, "event", "payload")
+    # 15.2) 显式 true 同号重试 → 200（与省略等价）
+    s, r = call("POST", "/events", {
+        "event_id": f"API-SEAL-C-{run_s}", "event_type": "seal_check", "sample_code": scode,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": f"SEAL-SEAL-{run_s}", "seal_intact": True,
+    })
+    print("显式 true 与省略同内容重试:", s, "幂等=", r.get("idempotent"))
+    # 15.3) 显式 false 同号 → 409 异内容（省略记录≠破损）
+    s, r = call("POST", "/events", {
+        "event_id": f"API-SEAL-C-{run_s}", "event_type": "seal_check", "sample_code": scode,
+        "occurred_at": "2026-09-30T03:30:00Z",
+        "checked_seal_no": f"SEAL-SEAL-{run_s}", "seal_intact": False,
+    })
+    print("对省略记录提交 false（异内容冲突）:", s, r.get("error", {}).get("code"))
+    # 15.4) 新事件号显式 false → 即使封签号相符也判 invalid，核定 422
+    s, r = call("POST", "/events", {
+        "event_id": f"API-SEAL-C2-{run_s}", "event_type": "seal_check", "sample_code": scode,
+        "occurred_at": "2026-09-30T03:35:00Z",
+        "checked_seal_no": f"SEAL-SEAL-{run_s}", "seal_intact": False,
+    })
+    show("明确封签破损（封签号相符仍 invalid）", s, r, "evaluation", "reasons")
+    s, r = call("POST", f"/samples/{scode}/approve", {"approver": "质量主管"})
+    print("破损链入库核定:", s, r.get("error", {}).get("code"))
 
 
 if __name__ == "__main__":

@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS custody_event (
     created_at         TEXT NOT NULL,
     superseded_by      TEXT,                             -- 被哪条纠错作废/替换（NULL=当前有效版本）
     replaces_event_id  TEXT,                             -- 替换产生的新事件：指向被替换的原事件号
-    batch_id           TEXT                              -- 批量移交提交时所属批次号（单事件上报为 NULL）
+    batch_id           TEXT,                             -- 批量移交提交时所属批次号（单事件上报为 NULL）
+    hash_gen           INTEGER                           -- 内容指纹代际：NULL=旧版（省略 seal_intact 落 false）；1=现行（省略按 true）
 );
 
 CREATE TABLE IF NOT EXISTS event_correction (
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS event_correction (
     new_event_id      TEXT,                              -- replace 时的新事件号（void 为 NULL）
     new_event_row_id  INTEGER REFERENCES custody_event(id), -- replace 时新事件行
     request_hash      TEXT NOT NULL,                     -- 纠错请求指纹（同纠错号幂等/冲突判定）
+    hash_gen          INTEGER,                          -- 指纹代际：NULL=旧版；1=现行（替换新事件省略 seal_intact 按 true）
     created_at        TEXT NOT NULL
 );
 
@@ -304,6 +306,13 @@ _MIGRATION_COLUMNS = {
         ("superseded_by", "TEXT"),
         ("replaces_event_id", "TEXT"),
         ("batch_id", "TEXT"),
+        # v2：指纹代际标记。旧行一律 NULL（含旧版省略 seal_intact 被误落为 false 的记录），
+        # 只补列、不回填、不重算任何历史指纹；现行代码新写入恒为 1。
+        ("hash_gen", "INTEGER"),
+    ],
+    "event_correction": [
+        # v2：纠错请求指纹代际标记（语义同 custody_event.hash_gen）。
+        ("hash_gen", "INTEGER"),
     ],
     "review": [
         ("reviewer_person_id", "TEXT"),                # 升级前旧意见保持 NULL，不伪造身份记录
@@ -312,8 +321,11 @@ _MIGRATION_COLUMNS = {
 
 # 启动升级版本号（写入 SQLite user_version，随升级事务一同提交/回滚）：
 # 1 = 建表 + 旧库补列 + 索引 + 版本 0 基线 的整轮原子升级。
+# 2 = 为 custody_event / event_correction 增补 hash_gen 指纹代际列：
+#     旧行保持 NULL（不回填、不重算历史指纹），新写入恒为 1，用于区分
+#     “旧版省略 seal_intact 被误落为 false”的历史记录与现行明确提交 false。
 # 已完成的库（user_version >= SCHEMA_VERSION）启动时直接沿用，不重复执行。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utcnow_iso() -> str:

@@ -14,7 +14,7 @@
 | 移交（transfer） | 必须由**当前保管人**发起；**移交至签收期间不得再次移交**，否则无效 |
 | 签收（receive） | 必须同时满足：匹配在途**移交单号**、**接收人**与移交单一致、**封签号**与登记一致、签收时间**晚于**移交时间 |
 | 重复签收 | 同一移交单被签收两次 → 无效（无效事件不可被后续补录抵消） |
-| 封签检查（seal_check） | 检查封签号与登记不符，或封签破损（`seal_intact=false`）→ 无效 |
+| 封签检查（seal_check） | 检查封签号与登记不符，或封签破损（明确提交 `seal_intact=false`）→ 无效；**省略 `seal_intact` 按完好（true）处理** |
 | 缺签收 | 移交后没有合格签收 → **待补证** |
 | 缺入库 | 没有实验室入库记录，或入库缺失前序移交-签收链 → **待补证** |
 | 保管人断链 | 移交人不是当前保管人 / 签收无对应在途移交 → **无效** |
@@ -83,7 +83,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 ### 启动升级与故障恢复（建表 / 旧库补列 / 索引 / 版本 0 基线）
 
-每次启动（容器入口脚本与 uvicorn 启动钩子都会执行）自动完成一轮**启动升级**：建表 → 旧库增量补列（如 `custody_event.superseded_by` 等）→ 依赖新列的索引 → 为尚无版本的旧样本补建**版本 0 基线**。本轮升级满足：
+每次启动（容器入口脚本与 uvicorn 启动钩子都会执行）自动完成一轮**启动升级**：建表 → 旧库增量补列（如 `custody_event.superseded_by` 等；v2 另补 `custody_event.hash_gen` / `event_correction.hash_gen` 指纹代际列，旧行 NULL、不回填、不重算历史指纹）→ 依赖新列的索引 → 为尚无版本的旧样本补建**版本 0 基线**。本轮升级满足：
 
 | 要求 | 行为 |
 |---|---|
@@ -196,7 +196,7 @@ curl http://localhost:8080/api/v1/samples        # 查看 3 条演示样本的�
 |---|---|---|
 | `transfer` | `transfer_no`、`from_custodian`、`to_custodian` | 移交单号、交出方（须当前保管人）、接收方 |
 | `receive` | `transfer_no`、`receiver`、`seal_no` | 匹配单号、签收人（须等于接收方）、签收封签号 |
-| `seal_check` | `checked_seal_no`（`seal_intact` 默认 true） | 检查读取的封签号、是否完好 |
+| `seal_check` | `checked_seal_no`（`seal_intact` 可省略，默认 true；明确 `false`=封签破损） | 检查读取的封签号、是否完好 |
 | `storage` | 无（建议 `custodian`、`storage_location`） | 实验室入库，`custodian` 默认“实验室” |
 
 公共字段：`event_id`（全局唯一）、`sample_code`、`occurred_at`、可选 `note`（备注参与幂等指纹）。
@@ -214,11 +214,17 @@ curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/j
   "occurred_at":"2026-09-30T04:00:00Z",
   "transfer_no":"TR-1","receiver":"李运输","seal_no":"SEAL-001"}'
 
-# 封签检查
+# 封签检查（seal_intact 可省略：省略或 true=完好；仅明确 false 表示破损）
 curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
   "event_id":"EVT-C1","event_type":"seal_check","sample_code":"S-001",
   "occurred_at":"2026-09-30T04:30:00Z",
-  "checked_seal_no":"SEAL-001","seal_intact":true}'
+  "checked_seal_no":"SEAL-001"}'
+
+# 发现封签破损时必须显式提交 false（封签号相符也判无效，入库核定被拒）
+curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
+  "event_id":"EVT-C2","event_type":"seal_check","sample_code":"S-001",
+  "occurred_at":"2026-09-30T04:35:00Z",
+  "checked_seal_no":"SEAL-001","seal_intact":false}'
 
 # 实验室入库
 curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/json' -d '{
@@ -229,6 +235,8 @@ curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/j
 
 - 新事件 `201`；同 `event_id` 同内容重试 `200`（`idempotent: true`）；异内容 `409 event_conflict`。
 - 响应中 `evaluation.status` / `reasons` / `current_custodian` 为写入后重算结果。
+- **`seal_intact` 默认值（现行规则）**：封签检查省略 `seal_intact` 与显式 `true` 等价（完好），落库内容统一为 `true`；只有明确提交 `false` 才表示封签破损。单事件上报与 5.5 替换纠错的 `new_event` 共用同一规则，核验结论、事件内容与新版本快照一致。
+- **历史兼容（不重算旧指纹）**：旧版本曾把省略字段误落为 `false`；这些已落库事件、纠错记录、历史版本快照与封存案卷一律保持原样（仍按破损核验）。旧记录的同请求重试（省略体或显式 `false`）仍返回原结果；对旧记录提交显式 `true`、或对新记录提交不一致的布尔值，仍按异内容 `409` 冲突。服务启动时自动执行 schema v2 升级：仅为 `custody_event` / `event_correction` 增补 `hash_gen` 指纹代际列（旧行 NULL、新行 1），不回填、不改写任何历史数据，升级原子可恢复。
 
 ### 5.3 查询
 
@@ -297,13 +305,14 @@ curl -X POST http://localhost:8080/api/v1/corrections -H 'Content-Type: applicat
   "action":"void","operator":"质控员","reason":"封签号录入错误，作废重报"}'
 
 # 替换：给出完整新事件内容与未占用的新事件号
+# new_event 的 seal_intact 规则与事件上报一致：省略按完好；仅明确 false 表示破损
 curl -X POST http://localhost:8080/api/v1/corrections -H 'Content-Type: application/json' -d '{
   "correction_id":"FIX-0002","sample_code":"S-001","target_event_id":"EVT-C1",
   "action":"replace","operator":"质控员","reason":"检查时扫码识别错误，整体替换",
   "new_event":{
     "event_id":"EVT-C2","event_type":"seal_check",
     "occurred_at":"2026-09-30T04:30:00Z",
-    "checked_seal_no":"SEAL-001","seal_intact":true}}'
+    "checked_seal_no":"SEAL-001"}}'
 ```
 
 响应（`201` 新纠错；`200` 同纠错号同内容幂等重试）：

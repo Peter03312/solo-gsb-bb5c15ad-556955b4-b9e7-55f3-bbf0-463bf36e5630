@@ -24,6 +24,7 @@ from typing import Any
 from .db import utcnow_iso
 from .schemas import BatchReconciliationIn
 from .service import (
+    HASH_GEN_CURRENT,
     DomainError,
     _effective_event_id,
     _fingerprint,
@@ -383,10 +384,10 @@ def submit_batch_reconciliation(
             ec = conn.execute(
                 "INSERT INTO custody_event"
                 " (sample_id, event_id, event_type, occurred_at, payload_json, content_hash,"
-                "  created_at, superseded_by, replaces_event_id, batch_id)"
-                " VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL)",
+                "  created_at, superseded_by, replaces_event_id, batch_id, hash_gen)"
+                " VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
                 (sample["id"], req_item.event_id, "receive", occurred_iso,
-                 payload_json, h, created_at),
+                 payload_json, h, created_at, HASH_GEN_CURRENT),
             )
         except sqlite3.IntegrityError:
             raise DomainError(

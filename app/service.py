@@ -3,7 +3,8 @@
 核验规则（与 README 一致）：
   * 移交必须由当前保管人发起；移交至签收期间不得再次移交；
   * 签收必须匹配移交单号、接收人、封签号，且发生在移交之后；重复签收无效；
-  * 封签检查封签号不符或封签破损 → 无效；
+  * 封签检查封签号不符或封签破损（明确提交 seal_intact=false）→ 无效；
+    省略 seal_intact 按完好（true）处理；
   * 缺签收 / 缺入库 → 待补证；
   * 断链、重复签收、封签不符 → 无效，无效优先于待补证；
   * 乱序补录按发生时间排序后整体重算；
@@ -23,6 +24,11 @@ from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn, Tra
 LAB_CUSTODIAN = "实验室"
 
 EVENT_TYPES = ("transfer", "receive", "seal_check", "storage")
+
+# 现行内容指纹代际（custody_event.hash_gen / event_correction.hash_gen）：
+# 旧版写入的行该列为 NULL——其中省略 seal_intact 的封签检查曾被 bool(None) 误落为 false；
+# 现行代码新写入恒为 1（省略按 true）。legacy 指纹兼容只对旧行放行。
+HASH_GEN_CURRENT = 1
 
 
 class DomainError(Exception):
@@ -70,6 +76,41 @@ def event_time_key(row: sqlite3.Row) -> tuple[datetime, int]:
 def _fingerprint(obj: dict[str, Any]) -> str:
     raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _event_canonical_hashes(
+    data: EventIn | NewEventIn, sample_code: str | None = None
+) -> tuple[dict[str, Any], str, str | None]:
+    """返回 (新规范字典, 新指纹, legacy 兼容指纹或 None)。
+
+    新指纹：省略 seal_intact 归一为 true（现行规则）。
+    legacy 指纹：仅当本次提交是 seal_check 且省略 seal_intact 时给出——
+    按旧规则（bool(None)=false）计算，用于命中旧版本落库的同号历史记录，
+    保证既有编号的同请求重试仍返回原结果，而不重写历史指纹。
+    其余情形 legacy 为 None（新规则与旧规则结果一致，无需兼容）。
+    """
+    canonical, payload = _event_canonical(data, sample_code)
+    h_new = _fingerprint(canonical)
+    h_legacy: str | None = None
+    if data.event_type == "seal_check" and data.seal_intact is None:
+        # 现行 canonical 中 seal_intact=true（payload 展开而来）；
+        # legacy canonical 仅把该键改回旧版的 false，其余字段不变。
+        legacy_canonical = {**canonical, "seal_intact": False}
+        h_legacy = _fingerprint(legacy_canonical)
+    return canonical, h_new, h_legacy
+
+
+def _hash_matches(stored_hash: str, h_new: str, h_legacy: str | None, stored_gen) -> bool:
+    """幂等命中：
+
+    * 现行行（hash_gen=1）：只按现行指纹比对——省略（=true）与明确 false 属异内容，报冲突；
+    * 旧版行（hash_gen IS NULL）：除现行指纹外，省略 seal_intact 的同请求再按 legacy
+      指纹（旧规则 bool(None)=false）命中，保证既有编号的同请求重试返回原结果，
+      而历史记录与历史指纹不重算、不改写。
+    """
+    if stored_hash == h_new:
+        return True
+    return stored_gen is None and h_legacy is not None and stored_hash == h_legacy
 
 
 def get_sample_or_404(conn: sqlite3.Connection, sample_code: str) -> sqlite3.Row:
@@ -144,6 +185,28 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
 
 # --------------------------------------------------------------------------- 事件写入
 
+def _event_payload(data: EventIn | NewEventIn) -> dict[str, Any]:
+    """按事件类型构造落库/参与指纹的 payload（字段集随事件类型固定）。"""
+    if data.event_type == "transfer":
+        return {
+            "transfer_no": data.transfer_no,
+            "from_custodian": data.from_custodian,
+            "to_custodian": data.to_custodian,
+        }
+    if data.event_type == "receive":
+        return {"transfer_no": data.transfer_no, "receiver": data.receiver, "seal_no": data.seal_no}
+    if data.event_type == "seal_check":
+        # 省略 seal_intact（None）按完好（true）处理；只有明确提交 false 才表示封签破损。
+        # 历史上省略曾被错误落为 false，那批旧记录保持原样不重算，
+        # 其同请求重试的兼容比对见 create_event / submit_correction 中的 legacy 指纹。
+        return {"checked_seal_no": data.checked_seal_no, "seal_intact": data.seal_intact is not False}
+    # storage
+    payload = {"custodian": data.custodian or LAB_CUSTODIAN}
+    if data.storage_location is not None:
+        payload["storage_location"] = data.storage_location
+    return payload
+
+
 def _event_canonical(data: EventIn | NewEventIn, sample_code: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """构造参与指纹的规范字典与落库 payload（字段集随事件类型固定）。
 
@@ -152,21 +215,7 @@ def _event_canonical(data: EventIn | NewEventIn, sample_code: str | None = None)
     """
     code = sample_code or getattr(data, "sample_code")
     occurred = to_utc_iso(data.occurred_at)
-    payload: dict[str, Any]
-    if data.event_type == "transfer":
-        payload = {
-            "transfer_no": data.transfer_no,
-            "from_custodian": data.from_custodian,
-            "to_custodian": data.to_custodian,
-        }
-    elif data.event_type == "receive":
-        payload = {"transfer_no": data.transfer_no, "receiver": data.receiver, "seal_no": data.seal_no}
-    elif data.event_type == "seal_check":
-        payload = {"checked_seal_no": data.checked_seal_no, "seal_intact": bool(data.seal_intact)}
-    else:  # storage
-        payload = {"custodian": data.custodian or LAB_CUSTODIAN}
-        if data.storage_location is not None:
-            payload["storage_location"] = data.storage_location
+    payload = _event_payload(data)
 
     canonical: dict[str, Any] = {
         "event_id": data.event_id,
@@ -188,15 +237,14 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
     """
     sample = get_sample_or_404(conn, data.sample_code)
 
-    canonical, payload = _event_canonical(data)
-    h = _fingerprint(canonical)
-    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    canonical, h, h_legacy = _event_canonical_hashes(data)
+    payload_json = json.dumps(_event_payload(data), ensure_ascii=False, separators=(",", ":"))
 
     # 幂等查重优先于冻结检查：既有规则（同 event_id 同内容 200 / 异内容 409）
     # 在核定入库后也保持兼容；新增事件才受历史冻结限制。
     existing = conn.execute("SELECT * FROM custody_event WHERE event_id = ?", (data.event_id,)).fetchone()
     if existing is not None:
-        if existing["content_hash"] != h:
+        if not _hash_matches(existing["content_hash"], h, h_legacy, existing["hash_gen"]):
             raise DomainError(
                 409,
                 "event_conflict",
@@ -219,14 +267,15 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
 
     try:
         cur = conn.execute(
-            "INSERT INTO custody_event (sample_id, event_id, event_type, occurred_at, payload_json, content_hash, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (sample["id"], data.event_id, data.event_type, canonical["occurred_at"], payload_json, h, utcnow_iso()),
+            "INSERT INTO custody_event (sample_id, event_id, event_type, occurred_at, payload_json, content_hash, created_at, hash_gen)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (sample["id"], data.event_id, data.event_type, canonical["occurred_at"], payload_json, h,
+             utcnow_iso(), HASH_GEN_CURRENT),
         )
     except sqlite3.IntegrityError:
         # 并发下唯一键竞争：重新读取后按幂等/冲突处理
         existing = conn.execute("SELECT * FROM custody_event WHERE event_id = ?", (data.event_id,)).fetchone()
-        if existing is not None and existing["content_hash"] == h:
+        if existing is not None and _hash_matches(existing["content_hash"], h, h_legacy, existing["hash_gen"]):
             return existing, True
         raise DomainError(409, "event_conflict", f"事件号 {data.event_id} 并发写入且内容冲突")
 
@@ -459,8 +508,17 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- 事件纠错（作废 / 替换）
 
-def _correction_fingerprint(data: CorrectionIn, new_canonical: dict[str, Any] | None) -> str:
-    obj = {
+def _correction_fingerprint(
+    data: CorrectionIn, new_canonical: dict[str, Any] | None,
+    new_canonical_legacy: dict[str, Any] | None = None,
+) -> tuple[str, str | None]:
+    """返回 (现行请求指纹, legacy 兼容指纹或 None)。
+
+    替换纠错的新事件省略 seal_intact 时，旧版本曾把它按 false 纳入纠错请求指纹；
+    legacy 指纹用于命中旧版本落库的同纠错号记录，保证同请求重试返回原结果，
+    不重算历史纠错指纹。
+    """
+    base = {
         "correction_id": data.correction_id,
         "sample_code": data.sample_code,
         "target_event_id": data.target_event_id,
@@ -468,9 +526,15 @@ def _correction_fingerprint(data: CorrectionIn, new_canonical: dict[str, Any] | 
         "operator": data.operator,
         "reason": data.reason,
     }
+    obj = dict(base)
     if new_canonical is not None:
         obj["new_event"] = new_canonical
-    return _fingerprint(obj)
+    h_legacy = None
+    if new_canonical_legacy is not None:
+        legacy_obj = dict(base)
+        legacy_obj["new_event"] = new_canonical_legacy
+        h_legacy = _fingerprint(legacy_obj)
+    return _fingerprint(obj), h_legacy
 
 
 def _get_correction(conn: sqlite3.Connection, correction_id: str) -> sqlite3.Row | None:
@@ -494,19 +558,29 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     sample = get_sample_or_404(conn, data.sample_code)
 
     new_canonical: dict[str, Any] | None = None
+    new_canonical_legacy: dict[str, Any] | None = None
     new_payload_json: str | None = None
     new_hash: str | None = None
     if data.new_event is not None:
-        new_canonical, new_payload = _event_canonical(data.new_event, sample_code=data.sample_code)
-        new_payload_json = json.dumps(new_payload, ensure_ascii=False, separators=(",", ":"))
-        new_hash = _fingerprint(new_canonical)
+        new_canonical, new_hash, new_event_hash_legacy = _event_canonical_hashes(
+            data.new_event, sample_code=data.sample_code
+        )
+        new_payload_json = json.dumps(_event_payload(data.new_event), ensure_ascii=False,
+                                      separators=(",", ":"))
+        if new_event_hash_legacy is not None:
+            # 与 _event_canonical_hashes 相同的 legacy 展开（仅 seal_intact 回到旧版 false），
+            # 供纠错请求指纹对旧版记录的同请求重试兼容比对。
+            new_canonical_legacy = {**new_canonical, "seal_intact": False}
 
-    request_hash = _correction_fingerprint(data, new_canonical)
+    request_hash, request_hash_legacy = _correction_fingerprint(
+        data, new_canonical, new_canonical_legacy
+    )
 
-    # 1) 同纠错号：同内容幂等 / 异内容冲突（与既有事件上报语义一致）
+    # 1) 同纠错号：同内容幂等 / 异内容冲突（与既有事件上报语义一致；
+    #    省略 seal_intact 的同请求重试另按 legacy 指纹命中旧记录）
     existing = _get_correction(conn, data.correction_id)
     if existing is not None:
-        if existing["request_hash"] != request_hash:
+        if not _hash_matches(existing["request_hash"], request_hash, request_hash_legacy, existing["hash_gen"]):
             raise DomainError(
                 409,
                 "correction_conflict",
@@ -577,23 +651,23 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
         ins = conn.execute(
             "INSERT INTO custody_event"
             " (sample_id, event_id, event_type, occurred_at, payload_json, content_hash,"
-            "  created_at, superseded_by, replaces_event_id)"
-            " VALUES (?,?,?,?,?,?,?,NULL,?)",
+            "  created_at, superseded_by, replaces_event_id, hash_gen)"
+            " VALUES (?,?,?,?,?,?,?,NULL,?,?)",
             (sample["id"], data.new_event.event_id, data.new_event.event_type,
              new_canonical["occurred_at"], new_payload_json, new_hash,
-             utcnow_iso(), data.target_event_id),
+             utcnow_iso(), data.target_event_id, HASH_GEN_CURRENT),
         )
         new_row_id = ins.lastrowid
 
     corr_cur = conn.execute(
         "INSERT INTO event_correction"
         " (correction_id, sample_id, target_event_id, action, operator, reason,"
-        "  new_event_id, new_event_row_id, request_hash, created_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "  new_event_id, new_event_row_id, request_hash, hash_gen, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (data.correction_id, sample["id"], data.target_event_id, data.action,
          data.operator, data.reason,
          data.new_event.event_id if data.new_event else None, new_row_id,
-         request_hash, utcnow_iso()),
+         request_hash, HASH_GEN_CURRENT, utcnow_iso()),
     )
     corr_row = conn.execute(
         "SELECT * FROM event_correction WHERE id = ?", (corr_cur.lastrowid,)
@@ -815,17 +889,16 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
             from_custodian=data.from_custodian,
             to_custodian=data.to_custodian,
         )
-        canonical, payload = _event_canonical(event)
-        h = _fingerprint(canonical)
-        payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        canonical, h, _h_legacy = _event_canonical_hashes(event)
+        payload_json = json.dumps(_event_payload(event), ensure_ascii=False, separators=(",", ":"))
         try:
             ec = conn.execute(
                 "INSERT INTO custody_event"
                 " (sample_id, event_id, event_type, occurred_at, payload_json, content_hash,"
-                "  created_at, superseded_by, replaces_event_id, batch_id)"
-                " VALUES (?,?,?,?,?,?,?,NULL,NULL,?)",
+                "  created_at, superseded_by, replaces_event_id, batch_id, hash_gen)"
+                " VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?)",
                 (srow["id"], it.event_id, "transfer", occurred, payload_json, h,
-                 created_at, data.batch_id),
+                 created_at, data.batch_id, HASH_GEN_CURRENT),
             )
         except sqlite3.IntegrityError:
             raise DomainError(
